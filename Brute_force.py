@@ -2,15 +2,18 @@ import os
 import time
 import hashlib
 import random
+import json
 from tqdm import tqdm
 from multiprocessing import Pool, cpu_count, Manager
 from ecdsa import SigningKey, SECP256k1
-from colorama import Fore, Style
-import datetime
+from colorama import Fore, Style, init
 
-# تهيئة colorama
-from colorama import init
+# Initialize colorama
 init()
+
+# Constants
+PROGRESS_FILE = "progress.json"
+SAVE_INTERVAL = 10000  # Save progress every 10000 keys
 
 def load_targets(file_path):
     """Load target addresses from challenge.txt"""
@@ -31,12 +34,35 @@ def save_results(file_path, found_data):
     except Exception as e:
         print(f"Error writing to file {file_path}: {e}")
 
-def generate_private_key(start_hex):
-    """Generate a private key starting from a specific hex value with random jumps"""
-    start_int = int(start_hex, 16)
-    jump = random.randint(1000000, 15000000)  # Random jump between 1 and 5 million
-    new_int = start_int + jump
-    return hex(new_int)[2:].zfill(64), jump
+def save_progress(last_key, keys_checked):
+    """Save progress to progress.json"""
+    progress_data = {
+        "last_key": last_key,
+        "keys_checked": keys_checked
+    }
+    try:
+        with open(PROGRESS_FILE, 'w') as file:
+            json.dump(progress_data, file, indent=4)
+        print(f"{Fore.YELLOW}Progress saved: Last Key = {last_key}, Keys Checked = {keys_checked}{Style.RESET_ALL}")
+    except Exception as e:
+        print(f"{Fore.RED}Error saving progress: {e}{Style.RESET_ALL}")
+
+def load_progress():
+    """Load progress from progress.json"""
+    if os.path.exists(PROGRESS_FILE):
+        try:
+            with open(PROGRESS_FILE, 'r') as file:
+                progress_data = json.load(file)
+                return progress_data["last_key"], progress_data["keys_checked"]
+        except Exception as e:
+            print(f"{Fore.RED}Error loading progress: {e}{Style.RESET_ALL}")
+    return None, 0
+
+def generate_private_key(current_hex):
+    """Generate the next private key sequentially"""
+    start_int = int(current_hex, 16)
+    next_int = start_int + 1  # Increment by 1 to cover the key space
+    return hex(next_int)[2:].zfill(64)
 
 def derive_address(private_key_hex):
     """Derive a Bitcoin address from a private key"""
@@ -57,56 +83,59 @@ def derive_address(private_key_hex):
 
         return address
     except Exception as e:
-        print(f"Error deriving address: {e}")
+        print(f"{Fore.RED}Error deriving address: {e}{Style.RESET_ALL}")
         return None
 
 def brute_force_worker(args):
     """Worker function for multiprocessing"""
     start_hex, end_hex, targets, found_data, progress = args
     current_hex = start_hex
-    start_time = time.time()  # وقت بدء العملية
-    keys_checked = 0  # عدد المفاتيح التي تم فحصها
-    while True:
-        private_key, jump = generate_private_key(current_hex)
+    keys_checked = 0  # Number of keys checked
+
+    while int(current_hex, 16) <= int(end_hex, 16):
+        private_key = generate_private_key(current_hex)
         address = derive_address(private_key)
         keys_checked += 1
-        
-        # حساب السرعة (مفاتيح في الثانية)
-        elapsed_time = time.time() - start_time
-        keys_per_second = keys_checked / elapsed_time if elapsed_time > 0 else 0
-        
-        # طباعة المفتاح والقفز والسرعة
-        print(f"{Fore.GREEN}Current Key: {private_key}{Style.RESET_ALL}, "
-              f"{Fore.BLUE}Jump: {jump}{Style.RESET_ALL}, "
-              f"{Fore.CYAN}Speed: {keys_per_second:.2f} keys/s{Style.RESET_ALL}")
-        
+
+        # Print progress
+        if keys_checked % 1000 == 0:  # Print every 1000 keys
+            print(f"{Fore.GREEN}Checked {keys_checked} keys{Style.RESET_ALL}")
+
         if address and address in targets:
             found_data.append((address, private_key))
-            targets.remove(address)  # إزالة العنوان الذي تم العثور عليه
-        current_hex = private_key  # الاستمرار من المفتاح الأخير الذي تم إنشاؤه
-        if int(current_hex, 16) >= int(end_hex, 16):
-            break  # التوقف إذا تجاوزنا end_hex
-        progress.value += 1  # تحديث التقدم
+            targets.remove(address)  # Remove found address from targets
+
+        current_hex = private_key  # Continue from the last generated key
+
+        # Save progress every SAVE_INTERVAL keys
+        if keys_checked % SAVE_INTERVAL == 0:
+            save_progress(current_hex, keys_checked)
+
+    return keys_checked
 
 def brute_force(targets, start_hex, end_hex):
-    """Brute force algorithm with multiprocessing and random jumps"""
+    """Brute force algorithm with multiprocessing"""
     manager = Manager()
     shared_targets = manager.list(targets)  # Shared list for targets
     shared_found_data = manager.list()  # Shared list for found data
-    progress = manager.Value('i', 0)  # Shared progress counter
 
     num_processes = cpu_count()  # Use all available CPU cores
+    range_size = (int(end_hex, 16) - int(start_hex, 16)) // num_processes
 
     # Prepare arguments for each worker
-    args = [(start_hex, end_hex, shared_targets, shared_found_data, progress) for _ in range(num_processes)]
+    args = [
+        (hex(int(start_hex, 16) + i * range_size), 
+         hex(int(start_hex, 16) + (i + 1) * range_size), 
+         shared_targets, shared_found_data, manager.Value('i', 0))
+        for i in range(num_processes)
+    ]
 
     # Start multiprocessing
     with Pool(num_processes) as pool:
         with tqdm(total=len(targets), desc="Searching") as pbar:
             while len(shared_targets) > 0:
                 pool.map(brute_force_worker, args)
-                pbar.update(progress.value)  # Update progress bar
-                progress.value = 0  # Reset progress counter
+                pbar.update(len(shared_found_data))
 
     return list(shared_found_data)
 
@@ -118,8 +147,14 @@ if __name__ == '__main__':
         print("No targets loaded. Exiting.")
     else:
         # Define the starting and ending hex keys
-        start_hex = "b9c27669757b7f281868e3e2eb2c5c20bd60c2834ab4ecf036db88ec53b8d110"
-        end_hex = "c7721e075da91afc2ef762aa7806aa74d952a65d5176d03cc9ac7a0ec0902bb8"
+        start_hex = "eccc7dfc52dc86782901058d54fb4024552c48fbd42e4f17e9721775d698f338"
+        end_hex = "ef24f3ec61bf180d5d267190850455797bcbbfd5919118035d0d383661824650"
+
+        # Load progress if available
+        last_key, keys_checked = load_progress()
+        if last_key:
+            print(f"{Fore.YELLOW}Resuming from last key: {last_key}{Style.RESET_ALL}")
+            start_hex = last_key
 
         print(f"Starting search from HEX: {start_hex} to HEX: {end_hex}")
 
